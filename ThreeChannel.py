@@ -36,6 +36,7 @@ from pytorch_learning_tools.utils.dataframe_utils import filter_dataframe
 from pytorch_learning_tools.utils.data_utils import classes_and_weights
 
 import collections
+import pickle
 
 
 class MitosisClassifier(object):
@@ -101,44 +102,11 @@ class MitosisClassifier(object):
         df.to_csv(csv_out, index=False)
         return df
 
-    def three_channel_transform(self):
-        w = 224
-        s = 2.5
+    def transform(self):
+        pass
 
-        # this is the xyz geometry imbeded in the image
-        gx = 96
-        gy = 128
-        gz = 64
 
-        # xyz once the image has been scaled by s
-        nx = int(round(s * gx))
-        ny = int(round(s * gy))
-        nz = int(round(s * gz))
-
-        nwidth = int(round(170 * s))
-        nheight = int(round(230 * s))
-
-        # offsets for each pain within the image
-        xo = 0
-        yo = 90
-        x2o = 40
-        y2o = 50
-        x3o = 40
-
-        # start coordinates for each fram
-        x1s = xo + 0
-        y1s = yo + 0
-        x2s = x2o + nz
-        y2s = y2o + (nheight - w - 50)
-        x3s = x3o + nz
-
-        return transforms.Compose(
-            [transforms.ToPILImage(), transforms.Resize(nwidth), transforms.CenterCrop((nheight, nwidth)),
-             transforms.ToTensor(), transforms.Lambda(lambda x: torch.stack(
-                [x[2, y1s:(w + y1s), x1s:(w + x1s)], x[2, y1s:(w + y1s), x2s:(w + x2s)],
-                 x[2, y2s:(w + y2s), x3s:(w + x3s)]]))])
-
-    def create_data_provider(self, df, testf=0.2):
+    def create_data_provider(self, df, splits_pkl, testf=0.2):
         split_fracs = {'train': 1.0 - testf, 'test': testf}
         split_seed = 1
 
@@ -148,18 +116,22 @@ class MitosisClassifier(object):
         for
             split in split_fracs.keys()}
 
-        dataset_kwargs['train']['imageTransform'] = self.three_channel_transform()
-        dataset_kwargs['test']['imageTransform']  = self.three_channel_transform()
+        dataset_kwargs['train']['imageTransform'] = self.transform()
+        dataset_kwargs['test']['imageTransform']  = self.transform()
+
+
+        splits_data = pickle.load(open(splits_pkl, "rb"))
 
         self.dp = DataframeDataProvider(df, datasetClass=DatasetSingleRGBImageToTarget,
-                                   split_fracs=split_fracs,
+                                   split_fracs=splits_data,
                                    split_seed=split_seed,
                                    uniqueID='save_h5_reg_path',
                                    dataset_kwargs=dataset_kwargs,
                                    dataloader_kwargs=dataloader_kwargs)
 
     def check_images(self, model, dkey='test'):
-        i, mb = next(enumerate(dp.dataloaders[dkey]))
+        i, mb = next(enumerate(self.dp.dataloaders[dkey]))
+        print("mb")
         ims_labels_preds = [(im, label, pred) for i, (im, label, pred) in enumerate(
             zip(mb['image'], mb['target'].numpy(),
                 model(Variable(mb['image']).cuda(self.GPU_ID)).data.cpu().max(1)[1].numpy())) if i < 16]
@@ -175,12 +147,14 @@ class MitosisClassifier(object):
     def generate_class_weights(self):
         classes, weights = classes_and_weights(self.dp, split='train', target_col='targetNumeric')
         weights = weights.cuda(self.GPU_ID)
-        CWP = collections.namedtuple('CWP', ['cls','weights'])
+        CWP = collections.namedtuple('CWP', ['cls', 'weights'])
         return CWP(classes, weights = weights)
 
     def phases(self):
         return self.dp.dataloaders.keys();
 
+    def pred_phases(self):
+        return self.dp
 
     def select_n_train_n_run_model(self):
         cwp = self.generate_class_weights()
@@ -201,7 +175,7 @@ class MitosisClassifier(object):
                             gpu_id=self.GPU_ID)
 
         torch.save(model.state_dict(), self.ofname('saved_model_10E', 'pt'))
-        self.check_images('train')
+        self.check_images(model, 'train')
 
         model.eval()
 
@@ -213,7 +187,7 @@ class MitosisClassifier(object):
                 x = mb['image']
                 y = mb['target']
 
-                y_hat_pred = model(Variable(x).cuda(GPU_ID))
+                y_hat_pred = model(Variable(x).cuda(self.GPU_ID))
                 _, y_hat = y_hat_pred.max(1)
 
                 mito_labels[phase]['true_labels'] += list(y.data.cpu().squeeze().numpy())
@@ -226,11 +200,13 @@ class MitosisClassifier(object):
 
         # model_analysis(mito_labels['train']['true_labels'], mito_labels['train']['pred_labels'])
 
-        img = plot_confusion_matrix(mito_labels['train']['true_labels'], mito_labels['train']['pred_labels'], classes=self.class_names())
-        img.save(self.ofname('CF_training', 'png'))
+        fig, ax = plot_confusion_matrix(mito_labels['train']['true_labels'], mito_labels['train']['pred_labels'], classes=self.class_names())
+        fig.savefig(self.ofname('CF_training', 'png'))
+        plt.close(fig)
 
-        img = plot_confusion_matrix(mito_labels['test']['true_labels'], mito_labels['test']['pred_labels'], classes=self.class_names())
-        img.save(self.ofname('CF_test', 'png'))
+        fig, ax = plot_confusion_matrix(mito_labels['test']['true_labels'], mito_labels['test']['pred_labels'], classes=self.class_names())
+        fig.savefig(self.ofname('CF_test', 'png'))
+        plt.close(fig)
 
         print("done with training and test.")
         #Apply to unannotated data
@@ -268,7 +244,7 @@ class MitosisClassifier(object):
         split: {'batch_size': self.BATCH_SIZE, 'shuffle': False, 'drop_last': False, 'num_workers': 4, 'pin_memory': True}
         for split in split_fracs.keys()}
 
-        dataset_kwargs['all']['imageTransform'] = self.three_channel_transform()
+        dataset_kwargs['all']['imageTransform'] = self.transform()
 
         dp_no_annots = DataframeDataProvider(df_no_annots, datasetClass=DatasetSingleRGBImageToTargetUniqueID,
                                              split_fracs=split_fracs,
@@ -306,8 +282,93 @@ class MitosisClassifier(object):
 
     def run_me(self):
         df = self.read_and_filter_input()
-        self.create_data_provider(df)
+        self.create_data_provider(df, "splits.pkl")
         print("ready to run.")
         self.select_n_train_n_run_model()
         print("finished.")
 
+
+class MitosisClassifierThreeChannel(MitosisClassifier):
+    def __init__(self, base_path, iter_n=0, f_label='MitosisLabel'):
+        MitosisClassifier.__init__(self, base_path, iter_n, f_label)
+
+
+    def transform(self):
+        return self.three_channel_transform()
+
+
+    def three_channel_transform(self):
+        w = 224
+        s = 2.5
+
+        # this is the xyz geometry imbeded in the image
+        gx = 96
+        gy = 128
+        gz = 64
+
+        # xyz once the image has been scaled by s
+        nx = int(round(s * gx))
+        ny = int(round(s * gy))
+        nz = int(round(s * gz))
+
+        nwidth = int(round(170 * s))
+        nheight = int(round(230 * s))
+
+        # offsets for each pain within the image
+        xo = 0
+        yo = 90
+        x2o = 40
+        y2o = 50
+        x3o = 40
+
+        # start coordinates for each fram
+        x1s = xo + 0
+        y1s = yo + 0
+        x2s = x2o + nz
+        y2s = y2o + (nheight - w - 50)
+        x3s = x3o + nz
+
+        return transforms.Compose(
+            [transforms.ToPILImage(), transforms.Resize(nwidth), transforms.CenterCrop((nheight, nwidth)),
+             transforms.ToTensor(), transforms.Lambda(lambda x: torch.stack(
+                [x[2, y1s:(w + y1s), x1s:(w + x1s)], x[2, y1s:(w + y1s), x2s:(w + x2s)],
+                 x[2, y2s:(w + y2s), x3s:(w + x3s)]]))])
+
+
+class MitosisClassifierOneChannel(MitosisClassifier):
+    def __init__(self, base_path, iter_n=0, f_label='MitosisLabel'):
+        MitosisClassifier.__init__(self, base_path, iter_n, f_label)
+
+
+    def transform(self):
+        return self.one_channel_transform()
+
+
+    def one_channel_transform(self):
+        w = 224
+
+        mask = torch.ones([3, w, w])
+        mask[0, :, :] = 0
+        mask[1, :, :] = 0
+        return transforms.Compose(
+            [transforms.ToPILImage(), transforms.Resize((w, w)),
+             transforms.ToTensor(), transforms.Lambda(lambda x: mask*x)])
+
+class MitosisClassifierZProj(MitosisClassifier):
+    def __init__(self, base_path, iter_n=0, f_label='MitosisLabel'):
+        MitosisClassifier.__init__(self, base_path, iter_n, f_label)
+
+
+    def transform(self):
+        return self.z_channel_transform()
+
+
+    def z_channel_transform(self):
+        w = 224
+
+        mask = torch.ones([3, w, w])
+        mask[0, :, :] = 0
+        mask[1, :, :] = 0
+        return transforms.Compose([transforms.ToPILImage(), transforms.Resize(256),
+                                   transforms.CenterCrop(224), transforms.ToTensor(),
+                                   transforms.Lambda(lambda x: mask*x)])
